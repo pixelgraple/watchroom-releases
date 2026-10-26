@@ -1,0 +1,151 @@
+name: Publish verified Watchroom update pointer
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing Watchroom release tag (watchroom-v0.1.0-beta.35)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: watchroom-stable-update-pointer
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Verify signed manifest and installer, then publish the stable pointer
+        shell: bash
+        run: |
+          node <<'NODE'
+          'use strict';
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          const repository = 'pixelgraple/watchroom-releases';
+          const prefix = `https://api.github.com/repos/${repository}`;
+          const POINTER = 'watchroom-updates/stable.json';
+          const MAX_EXE = 512 * 1024 * 1024;
+          const MAX_META = 64 * 1024;
+          const headers = { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' };
+          function check(value, message) { if (!value) throw Error(message); }
+          async function bounded(response, limit, hashOnly = false) {
+            check(response.ok && response.body, `HTTP ${response.status} reading release data`);
+            const length = response.headers.get('content-length');
+            check(!length || (/^\d+$/.test(length) && Number(length) <= limit), 'Release response exceeds its size limit');
+            let size = 0;
+            const parts = [], hash = crypto.createHash('sha256');
+            for await (const bytes of response.body) {
+              size += bytes.length; check(size <= limit, 'Release stream exceeds its size limit');
+              hash.update(bytes); if (!hashOnly) parts.push(Buffer.from(bytes));
+            }
+            return { size, sha256: hash.digest('hex'), bytes: hashOnly ? null : Buffer.concat(parts) };
+          }
+          async function api(route, options = {}, optional = false) {
+            const response = await fetch(prefix + route, { ...options, headers: { ...headers, ...options.headers }, redirect: 'error', signal: AbortSignal.timeout(30000) });
+            if (optional && response.status === 404) return null;
+            return JSON.parse((await bounded(response, 1024 * 1024)).bytes.toString('utf8'));
+          }
+          async function asset(item, limit, hashOnly = false) {
+            check(item && Number.isSafeInteger(item.id) && Number.isSafeInteger(item.size) && item.size > 0 && item.size <= limit, 'Invalid release asset');
+            let response = await fetch(prefix + '/releases/assets/' + item.id, { headers: { ...headers, Accept: 'application/octet-stream' }, redirect: 'manual', signal: AbortSignal.timeout(600000) });
+            if ([301,302,303,307,308].includes(response.status)) {
+              const target = new URL(response.headers.get('location'));
+              check(target.protocol === 'https:' && target.hostname === 'release-assets.githubusercontent.com' && !target.username && !target.password && !target.port && !target.hash && target.pathname.startsWith('/github-production-release-asset/'), 'Unexpected release asset redirect');
+              await response.body?.cancel();
+              // The repository token is deliberately NOT sent to asset storage.
+              response = await fetch(target.href, { redirect: 'error', signal: AbortSignal.timeout(600000) });
+            }
+            const result = await bounded(response, limit, hashOnly);
+            check(result.size === item.size, 'Release asset changed during verification');
+            return result;
+          }
+          function version(text) {
+            const match = typeof text === 'string' && text.length <= 100 && /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?$/.exec(text);
+            check(match && match.slice(1,4).every(n => Number.isSafeInteger(Number(n))), 'Invalid release version');
+            return { main: match.slice(1,4).map(Number), pre: match[4]?.split('.') || [] };
+          }
+          function compare(left, right) {
+            const a = version(left), b = version(right);
+            for (let i=0;i<3;i++) if(a.main[i]!==b.main[i]) return a.main[i]>b.main[i]?1:-1;
+            if(!a.pre.length||!b.pre.length) return a.pre.length===b.pre.length?0:a.pre.length?-1:1;
+            for(let i=0;i<Math.max(a.pre.length,b.pre.length);i++) {
+              const x=a.pre[i],y=b.pre[i]; if(x===y)continue;
+              if(x===undefined||y===undefined)return x===undefined?-1:1;
+              const nx=/^\d+$/.test(x),ny=/^\d+$/.test(y);
+              if(nx&&ny)return BigInt(x)>BigInt(y)?1:-1;
+              if(nx!==ny)return nx?-1:1;
+              return x>y?1:-1;
+            }
+            return 0;
+          }
+          function decode(text, limit) {
+            check(typeof text==='string'&&/^[A-Za-z0-9_-]+$/.test(text)&&text.length<=Math.ceil(limit*4/3)+2,'Invalid signed data');
+            const value=Buffer.from(text,'base64url');check(value.length<=limit&&value.toString('base64url')===text,'Noncanonical signed data');return value;
+          }
+          let keys;
+          function verify(envelope, allowExpired = false) {
+            check(envelope?.schema===1&&/^[a-zA-Z0-9_-]{1,64}$/.test(envelope.keyId)&&Object.hasOwn(keys,envelope.keyId),'Unknown signing key');
+            const key=crypto.createPublicKey(keys[envelope.keyId]);check(key.asymmetricKeyType==='ed25519','Invalid signing key');
+            const data=decode(envelope.payload,MAX_META/2),signature=decode(envelope.signature,64);
+            check(signature.length===64&&crypto.verify(null,data,key,signature),'Invalid release signature');
+            const value=JSON.parse(data.toString('utf8'));version(value.version);
+            check(value.schema===1&&value.appId==='xyz.twinyoumusic.watchroom','Wrong release application');
+            const published=Date.parse(value.publishedAt),expires=Date.parse(value.expiresAt);
+            check(Number.isFinite(published)&&Number.isFinite(expires)&&published<=Date.now()+300000&&expires>published&&expires-published<=366*86400000&&(allowExpired||expires>Date.now()),'Invalid or expired release dates');
+            const installer=value.installer;
+            check(installer&&Number.isSafeInteger(installer.bytes)&&installer.bytes>0&&installer.bytes<=MAX_EXE&&/^[a-f0-9]{64}$/.test(installer.sha256),'Invalid installer metadata');
+            const name=`Watchroom-Setup-${value.version}.exe`;
+            check([`https://twinyoumusic.xyz/watchroom/downloads/${name}`,`https://github.com/${repository}/releases/download/watchroom-v${value.version}/${name}`].includes(installer.url),'Unexpected installer URL');
+            if(value.releaseNotesUrl){
+              const notes=new URL(value.releaseNotesUrl);
+              check(!notes.username&&!notes.password&&!notes.port&&!notes.search&&!notes.hash&&notes.protocol==='https:'&&
+                (notes.origin==='https://twinyoumusic.xyz'||notes.href===`https://github.com/${repository}/releases/tag/watchroom-v${value.version}`),'Unexpected release notes URL');
+            }
+            return value;
+          }
+          (async()=>{
+            check(process.env.GITHUB_REPOSITORY===repository,'This workflow belongs to the public Watchroom release repository');
+            const event=JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH,'utf8'));
+            let release;
+            if(process.env.GITHUB_EVENT_NAME==='workflow_dispatch') {
+              check(typeof event.inputs?.tag==='string'&&event.inputs.tag.startsWith('watchroom-v'),'Choose a Watchroom release tag');
+              version(event.inputs.tag.slice('watchroom-v'.length));
+              release=await api('/releases/tags/'+encodeURIComponent(event.inputs.tag));
+            } else {
+              check(Number.isSafeInteger(event.release?.id),'Missing published release');
+              release=await api('/releases/'+event.release.id);
+            }
+            check(!release.draft&&release.tag_name.startsWith('watchroom-v'),'Not a published Watchroom release');
+            const keyFile=await api('/contents/watchroom-updates/public-keys.json?ref=main');
+            check(keyFile.encoding==='base64'&&keyFile.size<32768,'Invalid public key configuration');
+            keys=JSON.parse(Buffer.from(keyFile.content,'base64').toString('utf8'));
+            const manifestAssets=release.assets.filter(a=>a.name==='watchroom-update.json');check(manifestAssets.length===1,'Upload exactly one watchroom-update.json asset');
+            const signed=JSON.parse((await asset(manifestAssets[0],MAX_META)).bytes.toString('utf8'));
+            const payload=verify(signed);check(release.tag_name==='watchroom-v'+payload.version,'Release tag does not match signed version');
+            const installers=release.assets.filter(a=>a.name===`Watchroom-Setup-${payload.version}.exe`);check(installers.length===1,'Upload exactly one matching installer');
+            const installer=await asset(installers[0],MAX_EXE,true);
+            check(installer.size===payload.installer.bytes&&installer.sha256===payload.installer.sha256,'Installer does not match signed metadata');
+            const previous=await api('/contents/'+POINTER+'?ref=main',{},true);
+            if(previous){
+              check(previous.encoding==='base64'&&previous.size<=MAX_META,'Invalid previous pointer');
+              const old=JSON.parse(Buffer.from(previous.content,'base64').toString('utf8')),oldPayload=verify(old,true);
+              const order=compare(payload.version,oldPayload.version);check(order>=0,'Refusing a release downgrade');
+              if(order===0){check(old.payload===signed.payload,'Published versions are immutable');console.log('Verified pointer already current');return;}
+            }
+            await api('/contents/'+POINTER,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+              message:'Publish verified Watchroom '+payload.version,branch:'main',...(previous?{sha:previous.sha}:{}),
+              content:Buffer.from(JSON.stringify(signed,null,2)+'\n').toString('base64')
+            })});
+            console.log('Verified Watchroom '+payload.version+' update pointer published');
+          })().catch(error=>{console.error(error.message);process.exitCode=1;});
+          NODE
