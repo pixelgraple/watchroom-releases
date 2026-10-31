@@ -105,11 +105,11 @@ jobs:
             const installer=value.installer;
             check(installer&&Number.isSafeInteger(installer.bytes)&&installer.bytes>0&&installer.bytes<=MAX_EXE&&/^[a-f0-9]{64}$/.test(installer.sha256),'Invalid installer metadata');
             const name=`Watchroom-Setup-${value.version}.exe`;
-            check([`https://twinyoumusic.xyz/watchroom/downloads/${name}`,`https://github.com/${repository}/releases/download/watchroom-v${value.version}/${name}`].includes(installer.url),'Unexpected installer URL');
+            check([`https://thepredatorhub.com/watchroom/downloads/${name}`,`https://twinyoumusic.xyz/watchroom/downloads/${name}`,`https://github.com/${repository}/releases/download/watchroom-v${value.version}/${name}`].includes(installer.url),'Unexpected installer URL');
             if(value.releaseNotesUrl){
               const notes=new URL(value.releaseNotesUrl);
               check(!notes.username&&!notes.password&&!notes.port&&!notes.search&&!notes.hash&&notes.protocol==='https:'&&
-                (notes.origin==='https://twinyoumusic.xyz'||notes.href===`https://github.com/${repository}/releases/tag/watchroom-v${value.version}`),'Unexpected release notes URL');
+                (['https://thepredatorhub.com','https://twinyoumusic.xyz'].includes(notes.origin)||notes.href===`https://github.com/${repository}/releases/tag/watchroom-v${value.version}`),'Unexpected release notes URL');
             }
             return value;
           }
